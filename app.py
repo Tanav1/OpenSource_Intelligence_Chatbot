@@ -1,109 +1,107 @@
-import streamlit as st
 import pandas as pd
 import pickle
-from palantir_models.models import OpenAiGptChatLanguageModel, GenericEmbeddingModel
-from language_model_service_api.languagemodelservice_api_completion_v3 import GptChatCompletionRequest
+from sklearn.metrics.pairwise import cosine_similarity
+
+from palantir_models.models import GenericEmbeddingModel, OpenAiGptChatLanguageModel
 from language_model_service_api.languagemodelservice_api_embeddings_v3 import GenericEmbeddingsRequest
+from language_model_service_api.languagemodelservice_api_completion_v3 import GptChatCompletionRequest
 from language_model_service_api.languagemodelservice_api import ChatMessage, ChatMessageRole
+from foundry.transforms import Dataset
 
-@st.cache_data
-def load_data_and_embeddings():
-    dataset = pd.read_parquet("transformed_gdelt_nonapi_data.parquet")
-    with open("chunk_embeddings.pkl", "rb") as file:
-        embeddings_dict = pickle.load(file)
-    return dataset, embeddings_dict
+# Load dataset and embedding model
+transformed_gdelt_nonapi_data = Dataset.get("gdelt_transformed_data").read_table(format="pandas")
+embedding_model = GenericEmbeddingModel.get("Text_Embedding_3_Large")
+gpt_model = OpenAiGptChatLanguageModel.get("GPT_4o")
 
-@st.cache_resource
-def load_model():
-    return OpenAiGptChatLanguageModel.get("GPT_4o")
+columns_to_use = [
+    "Location", "Sentiment", "flattenedPeople", "flattenedOrganizations",
+    "flattenedIntelligence_Agencies", "flattenedTerrorist_Groups", "flattenedHostile_Actions",
+    "flattenedConflict_Zones", "flattenedMeetings_and_Summits", "flattenedGeopolitical_Risks",
+    "flattenedInstallations_and_Bases", "flattenedWeapons_Systems", "flattenedOperations_and_Exercises",
+    "Entities", "Translated_Headline", "URL", "Date"
+]
 
-def generate_summary(model, context):
+def combine_columns(row):
+    return "\n".join(f"{col}: {row[col]}" for col in columns_to_use if pd.notnull(row[col]))
+
+transformed_gdelt_nonapi_data['Combined_Text'] = transformed_gdelt_nonapi_data.apply(combine_columns, axis=1)
+
+def split_text_into_chunks(text, max_tokens=800):
+    sentences = text.split(". ")
+    chunks, current_chunk, current_length = [], [], 0
+    for sentence in sentences:
+        token_length = len(sentence.split())
+        if current_length + token_length > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk, current_length = [], 0
+        current_chunk.append(sentence)
+        current_length += token_length
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
+
+transformed_gdelt_nonapi_data['Text_Chunks'] = transformed_gdelt_nonapi_data['Combined_Text'].apply(split_text_into_chunks)
+
+def generate_chunk_embeddings(chunks):
+    request = GenericEmbeddingsRequest(inputs=chunks)
+    response = embedding_model.create_embeddings(request)
+    return response.embeddings
+
+transformed_gdelt_nonapi_data['Chunk_Embeddings'] = transformed_gdelt_nonapi_data['Text_Chunks'].apply(generate_chunk_embeddings)
+
+# Map: URL -> list of chunk embeddings
+embeddings_dict = {}
+for _, row in transformed_gdelt_nonapi_data.iterrows():
+    embeddings_dict.setdefault(row['URL'], []).extend(row['Chunk_Embeddings'])
+
+def retrieve_relevant_context(query, top_k=3):
+    query_embedding = embedding_model.create_embeddings(GenericEmbeddingsRequest([query])).embeddings[0]
+    similarities = []
+    for url, embeddings in embeddings_dict.items():
+        for emb in embeddings:
+            score = cosine_similarity([query_embedding], [emb])[0][0]
+            similarities.append((score, url))
+    top_urls = [url for _, url in sorted(similarities, reverse=True)[:top_k]]
+    return list(set(top_urls))
+
+def generate_response(query, conversation_history=[]):
+    relevant_urls = retrieve_relevant_context(query)
+    context = "\n\n---\n\n".join(
+        transformed_gdelt_nonapi_data.loc[
+            transformed_gdelt_nonapi_data['URL'] == url, 'Combined_Text'
+        ].values[0] for url in relevant_urls
+    )
+    conversation_history_text = "\n".join(
+        f"User: {msg['user']}\nAI: {msg['ai']}" for msg in conversation_history
+    )
+    prompt = (
+        "You are an AI assistant with deep knowledge of the GDELT dataset. "
+        "Provide insightful and concise answers to user questions based on the provided context and conversation history. "
+        "Try to add citations from the dataset in the form of the Translated_Headline column.\n\n"
+        f"Context: {context}\n\n"
+        f"Conversation History:\n{conversation_history_text}\n\n"
+        f"User Question: {query}\n\n"
+        f"AI Response:"
+    )
+    request = GptChatCompletionRequest([ChatMessage(ChatMessageRole.USER, prompt)])
     try:
-        prompt = (
-            "You are an AI assistant providing insights for an OSINT analyst. "
-            "Analyze the following dataset content and generate a concise, high-level summary that highlights "
-            "key entities, themes, and potential relevance for open-source intelligence purposes. "
-            "Also make sure to add a list of at least 30 potential topics. "
-            "Make sure to read through the entire dataset:\n\n"
-            f"Dataset Content: {context}"
-        )
-        request = GptChatCompletionRequest([ChatMessage(ChatMessageRole.USER, prompt)])
-        response = model.create_chat_completion(request)
+        response = gpt_model.create_chat_completion(request)
         return response.choices[0].message.content
     except Exception as e:
         return f"Error: {str(e)}"
 
-def get_answer(model, query, context, conversation_history):
-    try:
-        conversation_history_text = "\n".join(
-            [f"{entry['role'].capitalize()}: {entry['content']}" for entry in conversation_history]
-        )
-        prompt = (
-            "You are an AI assistant with deep knowledge of the GDELT dataset. "
-            "Provide insightful and concise answers to user questions based on the provided context and conversation history. "
-            "Try to add citations from the dataset in the form of the Translated_Headline column. "
-            "Make sure to read through the entire dataset before giving a response.\n\n"
-            f"Context: {context}\n\n"
-            f"Conversation History:\n{conversation_history_text}\n\n"
-            f"User Question: {query}\n\n"
-            f"AI Response:"
-        )
-        request = GptChatCompletionRequest([ChatMessage(ChatMessageRole.USER, prompt)])
-        response = model.create_chat_completion(request)
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error: {str(e)}"
+# Example usage
+if __name__ == "__main__":
+    sample_query = "What is happening in Russia right now?"
+    conversation = [
+        {"user": "What does the dataset contain?", "ai": "The dataset contains information about geopolitical events."},
+        {"user": "Can you give me an example?", "ai": "For example, it mentions trade wars and cybersecurity risks."}
+    ]
+    print(generate_response(sample_query, conversation))
 
-@st.cache_data
-def prepare_context(data, max_chars=500000):
-    context = data.astype(str).fillna("").apply(lambda row: " ".join(row), axis=1).str.cat(sep=" ")
-    return context[:max_chars]
+    # Save embeddings to file
+    chunk_embeddings_dict = transformed_gdelt_nonapi_data[['URL', 'Chunk_Embeddings']].set_index('URL').to_dict()['Chunk_Embeddings']
+    with open("chunk_embeddings.pkl", "wb") as file:
+        pickle.dump(chunk_embeddings_dict, file)
 
-st.title("Open Source Intelligence Chatbot")
-st.write("Interact with open-source intelligence data in natural language.")
-
-data, embeddings_dict = load_data_and_embeddings()
-model = load_model()
-initial_context = prepare_context(data)
-
-st.subheader("Dataset Preview")
-st.dataframe(data.head())
-
-st.subheader("Dataset Summary")
-with st.spinner("Generating summary..."):
-    summary = generate_summary(model, initial_context)
-
-if summary.startswith("Error"):
-    st.error(summary)
-else:
-    st.markdown('## Key ideas and themes of the dataset:')
-    st.markdown(summary)
-
-st.subheader("Chat Interface")
-if "conversation_history" not in st.session_state:
-    st.session_state.conversation_history = []
-
-for entry in st.session_state.conversation_history:
-    if isinstance(entry, dict) and "role" in entry and "content" in entry:
-        if entry["role"] == "user":
-            st.markdown(f"**User:** {entry['content']}")
-        elif entry["role"] == "ai":
-            st.markdown(f"**AI:** {entry['content']}")
-
-st.divider()
-st.subheader("Ask Your Question")
-question = st.text_input("Type your question here:")
-
-if st.button("Get Answer"):
-    if question.strip() == "":
-        st.warning("Please enter a question!")
-    else:
-        response = get_answer(
-            model=model,
-            query=question,
-            context=initial_context,
-            conversation_history=st.session_state.conversation_history
-        )
-        st.session_state.conversation_history.append({"role": "user", "content": question})
-        st.session_state.conversation_history.append({"role": "ai", "content": response})
-        st.markdown(f"**AI:** {response}")
+    print("Chunk embeddings saved successfully!")
