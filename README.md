@@ -16,10 +16,10 @@ This project was developed as part of the Palantir Winter Defense Tech Fellowshi
 
 ## Technical Stack
 
-- **LLM Provider**: GPT-4o
+- **LLM**: GPT-4o 
 - **Frontend**: Streamlit
-- **Embedding Model**: Palantir’s internal embedding services
-- **Platform**: Palantir Foundry (required for full functionality)
+- **Embedding Model**: Text_Embedding_3_Large
+- **Platform**: Palantir Foundry + AIP (required for full functionality)
 - **Data**: GDELT threat-related datasets
 
 ## Data Pipeline
