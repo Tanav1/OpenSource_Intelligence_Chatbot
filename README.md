@@ -48,7 +48,7 @@ A robust data pipeline was built in **Palantir Foundry** to prepare the dataset 
 
 ### Pipeline Diagram
 
-![Data Pipeline Screenshot](.pipeline.png)
+![Data Pipeline Screenshot](pipeline.png)
 
 ## Demo
 
